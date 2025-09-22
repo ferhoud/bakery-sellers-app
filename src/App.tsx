@@ -1,60 +1,76 @@
+import React, { useEffect, useState } from "react"
+import { supabase } from "./supabaseClient"
+import Schedule from "./components/Schedule"
 
-import React, { useEffect, useState } from 'react'
-import { supabase } from './supabaseClient'
-import { Session } from '@supabase/supabase-js'
-import Dashboard from './components/Dashboard'
-
-export default function App() {
-  const [session, setSession] = useState<Session | null>(null)
-
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session)
-    })
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
-      setSession(session)
-    })
-    return () => listener.subscription.unsubscribe()
-  }, [])
-
-  if (!session) {
-    return <AuthView />
-  }
-  return <Dashboard />
-}
+type SessionLike = any
 
 function AuthView() {
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
+  const [username, setUsername] = useState("")
+  const [code, setCode] = useState("")
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
 
-  const signIn = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setLoading(true); setError(null)
-    const { error } = await supabase.auth.signInWithPassword({ email, password })
-    if (error) setError(error.message)
-    setLoading(false)
-  }
+  const toEmail = (u: string) => `${u.trim().toLowerCase()}@vendeuses.local`
 
-  const signUp = async (e: React.FormEvent) => {
+  const signInOrUp = async (e: React.FormEvent) => {
     e.preventDefault()
-    setLoading(true); setError(null)
-    const { error } = await supabase.auth.signUp({ email, password })
-    if (error) setError(error.message)
+    setError(null)
+
+    const u = username.trim().toLowerCase()
+    if (!u) {
+      setError("Renseigne l’identifiant.")
+      return
+    }
+    if (code.length < 6) {
+      setError("Le code doit contenir au moins 6 caractères.")
+      return
+    }
+
+    setLoading(true)
+    const email = toEmail(u)
+
+    // 1) Essayer de se connecter
+    const { error: signInError } = await supabase.auth.signInWithPassword({
+      email,
+      password: code,
+    })
+
+    // 2) Si échec, créer l’utilisateur (Confirm Email = OFF côté Supabase)
+    if (signInError) {
+      const { error: signUpError } = await supabase.auth.signUp({ email, password: code })
+      if (signUpError) {
+        setError(signUpError.message)
+        setLoading(false)
+        return
+      }
+
+      // 3) Créer/compléter la fiche dans sellers (si besoin)
+      try {
+        await supabase
+          .from("sellers")
+          .insert({ name: username, username: u, email })
+          .select()
+          .single()
+      } catch {
+        // ok si déjà existant
+      }
+
+      // 4) Reconnexion
+      const { error: signInError2 } = await supabase.auth.signInWithPassword({ email, password: code })
+      if (signInError2) {
+        setError(signInError2.message)
+        setLoading(false)
+        return
+      }
+    }
+
     setLoading(false)
   }
 
   return (
-    <div style={{ maxWidth: 360, margin: '64px auto', fontFamily: 'system-ui' }}>
-      <h1 style={{ marginBottom: 16 }}>Connexion vendeuse</h1>
-      <form onSubmit={signIn} style={{ display: 'grid', gap: 8 }}>
-        <input placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} />
-        <input type="password" placeholder="Mot de passe" value={password} onChange={e => setPassword(e.target.value)} />
-        <button disabled={loading} type="submit">Se connecter</button>
-        <button disabled={loading} onClick={signUp}>Créer un compte</button>
-      </form>
-      {error && <p style={{ color: 'crimson' }}>{error}</p>}
-    </div>
-  )
-}
+    <div style={{ maxWidth: 380, margin: "64px auto", fontFamily: "system-ui" }}>
+      <h1 style={{ marginBottom: 8 }}>Connexion vendeuse</h1>
+      <p style={{ marginTop: 0, opacity: 0.8, fontSize: 14 }}>
+        Entre ton <strong>identifiant</strong> (ex: <code>leila</code>) et ton <strong>code</strong>.
+      </p>
+      <form onSubmit={signInOrUp} style={{ dis
