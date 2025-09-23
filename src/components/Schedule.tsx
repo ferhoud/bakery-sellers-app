@@ -1,269 +1,216 @@
-import React, { useEffect, useMemo, useState } from "react"
-import { supabase } from "../supabaseClient"
-
-// Libellés des créneaux
-const SLOT_LABEL: Record<string, string> = {
-  open: "Matin (06:30–13:30)",
-  mid: "Renfort (07:00–13:00)",
-  close: "Après-midi (13:30–20:30)"
-}
-type SlotKey = "open" | "mid" | "close"
-const SLOTS: SlotKey[] = ["open", "mid", "close"]
+import { useEffect, useMemo, useState } from 'react'
+import { supabase } from '../lib/supabaseClient' // ← garde ce chemin relatif (Vite)
 
 type Seller = { id: string; full_name: string; created_at: string }
-type ShiftRow = { id?: string; day: string; slot: SlotKey; seller_id: string }
-type AbsenceRow = {
-  id: string
-  seller_id: string
-  day: string
-  slot: SlotKey
-  status: "pending" | "candidate" | "approved" | "rejected" | "cancelled"
-  replacement_seller_id?: string | null
-  created_at?: string
-  owner?: { id: string; name: string | null } | null
-  replacement?: { id: string; name: string | null } | null
+type Slot = 'MORNING' | 'AFTERNOON' | 'EVENING'
+type Shift = { id: string; date: string; slot: Slot; seller_id: string | null; created_at: string }
+
+const SLOT_LABEL: Record<Slot, string> = {
+  MORNING: 'Matin',
+  AFTERNOON: 'Après-midi',
+  EVENING: 'Soir',
 }
 
-// ✅ format YYYY-MM-DD en LOCAL (pas d'UTC)
-function ymdLocal(d: Date) {
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, "0")
-  const day = String(d.getDate()).padStart(2, "0")
-  return `${y}-${m}-${day}`
+function iso(d: Date) {
+  return d.toISOString().slice(0, 10)
+}
+function mondayWeek(from = new Date()) {
+  const f = new Date(from)
+  const day = f.getDay() || 7
+  if (day !== 1) f.setDate(f.getDate() - (day - 1))
+  return Array.from({ length: 7 }).map((_, i) => {
+    const dt = new Date(f)
+    dt.setDate(f.getDate() + i)
+    return {
+      date: iso(dt),
+      label: dt.toLocaleDateString('fr-FR', { weekday: 'short', day: '2-digit', month: '2-digit' }),
+    }
+  })
 }
 
-// Couleur stable par vendeuse
-const PALETTE = [
-  "#EF9A9A", "#F48FB1", "#CE93D8", "#B39DDB",
-  "#90CAF9", "#80DEEA", "#A5D6A7", "#E6EE9C",
-  "#FFCC80", "#FFAB91", "#BCAAA4", "#B0BEC5"
-]
-function colorFor(id: string) {
-  let h = 0
-  for (let i = 0; i < id.length; i++) h = (h << 5) - h + id.charCodeAt(i)
-  const idx = Math.abs(h) % PALETTE.length
-  return PALETTE[idx]
-}
-
-export default function Schedule({ isAdmin }: { isAdmin: boolean }) {
+export default function Schedule() {
+  const days = useMemo(() => mondayWeek(), [])
   const [sellers, setSellers] = useState<Seller[]>([])
-  const [shifts, setShifts] = useState<ShiftRow[]>([])
-  const [todayAbsences, setTodayAbsences] = useState<AbsenceRow[]>([])
-  const [busy, setBusy] = useState(false)
-  const sellersById = useMemo(() => Object.fromEntries(sellers.map(s => [s.id, s])), [sellers])
+  const [shifts, setShifts] = useState<Record<string, Shift>>({})
+  const [loading, setLoading] = useState(true)
+  const [errorMsg, setErrorMsg] = useState<string | null>(null)
+  const [lastRefresh, setLastRefresh] = useState<string>('')
 
-  // Semaine (lundi → dimanche) en LOCAL
-  const base = new Date()
-  const weekStart = new Date(base)
-  weekStart.setDate(base.getDate() - ((base.getDay() + 6) % 7)) // lundi
-  const weekDays: string[] = Array.from({ length: 7 }, (_, i) => ymdLocal(new Date(weekStart.getTime() + i * 86400000)))
-  const todayStr = ymdLocal(new Date())
+  // ---- API ----
+  async function fetchSellers() {
+    const { data, error } = await supabase
+      .from('sellers')
+      .select('id,full_name,created_at') // ← pas de is_active ici
+      .order('full_name', { ascending: true })
 
-  // Accès rapide
-  const keyOf = (day: string, slot: SlotKey) => `${day}|${slot}`
-  const mapShifts = useMemo(() => {
-    const m = new Map<string, ShiftRow>()
-    shifts.forEach(s => m.set(keyOf(s.day, s.slot), s))
-    return m
-  }, [shifts])
-
-  function getSellerId(day: string, slot: SlotKey) {
-    const row = mapShifts.get(keyOf(day, slot))
-    return row?.seller_id || ""
+    if (error) throw error
+    console.log('[DBG] sellers fetched:', data?.length, data)
+    return (data || []) as Seller[]
   }
 
-  function alreadyAssignedThisDay(sellerId: string, day: string, exceptSlot?: SlotKey) {
-    if (!sellerId) return false
-    return SLOTS.some(sl => {
-      if (sl === exceptSlot) return false
-      const r = mapShifts.get(keyOf(day, sl))
-      return r?.seller_id === sellerId
-    })
+  async function fetchWeekShifts() {
+    const from = days[0].date
+    const to = days[days.length - 1].date
+    const { data, error } = await supabase
+      .from('shifts')
+      .select('id,date,slot,seller_id,created_at')
+      .gte('date', from)
+      .lte('date', to)
+
+    if (error) throw error
+    const map: Record<string, Shift> = {}
+    ;(data || []).forEach((s: any) => (map[`${s.date}:${s.slot}`] = s))
+    console.log('[DBG] shifts fetched:', (data || []).length, data)
+    return map
   }
 
-  async function loadAll() {
-    // vendeuses
-    const { data: s } = await supabase.from("sellers").select("id,name,email,role").order("name", { ascending: true })
-    setSellers(s || [])
-
-    // shifts (semaine) — bornes locales
-    const startStr = weekDays[0]
-    const endStrDate = new Date(weekStart.getTime() + 7 * 86400000) // lundi suivant
-    const endStr = ymdLocal(endStrDate)
-
-    const { data: sh } = await supabase
-      .from("shifts")
-      .select("id, day, slot, seller_id")
-      .gte("day", startStr)
-      .lt("day", endStr)
-      .order("day", { ascending: true })
-    setShifts((sh as any) || [])
-
-    // absences du jour (jointure noms)
-    const { data: abs } = await supabase
-      .from("absences")
-      .select(`
-        id, seller_id, day, slot, status, replacement_seller_id, created_at,
-        owner:seller_id ( id, name ),
-        replacement:replacement_seller_id ( id, name )
-      `)
-      .eq("day", todayStr)
-      .order("created_at", { ascending: true })
-    setTodayAbsences((abs as any) || [])
-  }
-
-  useEffect(() => {
-    loadAll()
-    const ch = supabase
-      .channel("schedule-rt")
-      .on("postgres_changes", { event: "*", schema: "public", table: "shifts" }, loadAll)
-      .on("postgres_changes", { event: "*", schema: "public", table: "absences" }, loadAll)
-      .subscribe()
-    return () => { supabase.removeChannel(ch) }
-  }, [])
-
-  async function setAssignment(day: string, slot: SlotKey, sellerId: string) {
-    if (!isAdmin) return
-    setBusy(true)
+  async function refreshAll() {
+    setLoading(true)
+    setErrorMsg(null)
     try {
-      if (sellerId && alreadyAssignedThisDay(sellerId, day, slot)) {
-        alert("Cette vendeuse est déjà affectée à un autre créneau le même jour.")
-        setBusy(false)
-        return
-      }
-      const existing = mapShifts.get(keyOf(day, slot))
-      if (!sellerId) {
-        if (existing?.id) await supabase.from("shifts").delete().eq("id", existing.id)
-      } else if (existing?.id) {
-        await supabase.from("shifts").update({ seller_id: sellerId }).eq("id", existing.id)
-      } else {
-        await supabase.from("shifts").insert({ day, slot, seller_id: sellerId })
-      }
-      await loadAll()
+      const [s, m] = await Promise.all([fetchSellers(), fetchWeekShifts()])
+      setSellers(s)
+      setShifts(m)
+      setLastRefresh(new Date().toLocaleString('fr-FR'))
+    } catch (e: any) {
+      console.error('[ERR] refreshAll:', e)
+      setErrorMsg(e.message || 'Erreur inconnue')
     } finally {
-      setBusy(false)
+      setLoading(false)
     }
   }
 
-  // Ruban du jour
-  const todayOpen  = getSellerId(todayStr, "open")
-  const todayMid   = getSellerId(todayStr, "mid")
-  const todayClose = getSellerId(todayStr, "close")
+  useEffect(() => {
+    refreshAll()
+  }, [])
 
+  async function assignSeller(date: string, slot: Slot, seller_id: string | null) {
+    setErrorMsg(null)
+    const key = `${date}:${slot}`
+    const prev = shifts[key]
+
+    // Optimistic UI
+    const temp: Shift =
+      prev ?? { id: crypto.randomUUID(), date, slot, seller_id, created_at: new Date().toISOString() }
+    setShifts({ ...shifts, [key]: { ...temp, seller_id } })
+
+    const payload = prev ? { id: prev.id, date, slot, seller_id } : { date, slot, seller_id }
+    console.log('[DBG] upsert payload:', payload)
+
+    const { data, error } = await supabase.from('shifts').upsert(payload).select().limit(1).maybeSingle()
+    if (error) {
+      console.error('[ERR] upsert:', error)
+      setErrorMsg(`Upsert échoué: ${error.message}`)
+      // rollback visuel
+      setShifts((s) => ({ ...s, [key]: prev ?? undefined }))
+      return
+    }
+    console.log('[DBG] upsert ok:', data)
+    await refreshAll()
+  }
+
+  function currentSellerId(date: string, slot: Slot) {
+    return shifts[`${date}:${slot}`]?.seller_id ?? ''
+  }
+
+  async function purgeCaches() {
+    try {
+      localStorage.clear()
+      if ('caches' in window) {
+        const keys = await caches.keys()
+        await Promise.all(keys.map((k) => caches.delete(k)))
+      }
+      if ('serviceWorker' in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations()
+        await Promise.all(regs.map((r) => r.unregister()))
+      }
+      alert('Caches vidés. Recharge la page (Ctrl+F5).')
+    } catch (e) {
+      console.warn('Purge caches error:', e)
+    }
+  }
+
+  // ---- UI ----
   return (
-    <div style={{ display: "grid", gap: 16 }}>
-      {/* Absences du jour (en premier) */}
-      <div style={{ border: "2px solid #ffc107", background: "#fff8e1", borderRadius: 10, padding: 12 }}>
-        <h3 style={{ margin: 0, marginBottom: 8 }}>Absences du jour</h3>
-        {todayAbsences.length === 0 && <div>Aucune absence aujourd’hui.</div>}
-        {todayAbsences.map(a => {
-          const ownerName = a.owner?.name ?? sellersById[a.seller_id]?.name ?? "?"
-          const replName  = a.replacement?.name ?? (a.replacement_seller_id ? (sellersById[a.replacement_seller_id!]?.name ?? "?") : null)
-          return (
-            <div key={a.id} style={{ padding: 8, border: "1px solid #ffe082", background: "#fffde7", borderRadius: 8, marginBottom: 8 }}>
-              <strong>{ownerName}</strong> — <em>{SLOT_LABEL[a.slot]}</em>
-              {" · "}
-              <span style={{ padding: "2px 6px", borderRadius: 6, border: "1px solid #ffd54f" }}>
-                {a.status === "pending" && "En attente de remplaçant"}
-                {a.status === "candidate" && "Candidature en attente de validation"}
-                {a.status === "approved" && "Remplacement validé"}
-                {a.status === "rejected" && "Refusée"}
-                {a.status === "cancelled" && "Annulée"}
-              </span>
-              {replName && <> — Remplacée par <strong>{replName}</strong></>}
-            </div>
-          )
-        })}
-      </div>
+    <div style={{ padding: '24px', display: 'grid', gap: '12px' }}>
+      <h1 style={{ fontSize: '20px', fontWeight: 600 }}>Planning — Debug</h1>
 
-      {/* Ruban “planning du jour” */}
-      <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12 }}>
-        <h3 style={{ marginTop: 0, marginBottom: 8 }}>Planning du jour — {todayStr}</h3>
-        <div style={{ display: "flex", gap: 6, alignItems: "stretch" }}>
-          {(["open","mid","close"] as SlotKey[]).map(slot => {
-            const sid = slot === "open" ? todayOpen : slot === "mid" ? todayMid : todayClose
-            return (
-              <div key={slot}
-                style={{
-                  flex: slot === "mid" ? 6 : 7,
-                  minHeight: 44,
-                  borderRadius: 8,
-                  border: "1px solid #ccc",
-                  background: sid ? colorFor(sid) : "#f6f6f6",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  color: sid ? "#000" : "#888",
-                  fontWeight: 600
-                }}
-                title={SLOT_LABEL[slot]}
-              >
-                {sid ? (sellersById[sid]?.name || "?") : "—"}
-              </div>
-            )
-          })}
+      <div
+        style={{
+          fontSize: '14px',
+          background: '#f8fafc',
+          border: '1px solid #e2e8f0',
+          borderRadius: 8,
+          padding: 12,
+        }}
+      >
+        <div>
+          Dernier refresh : <b>{lastRefresh || '—'}</b>
+        </div>
+        <div>
+          Vendeuses lues depuis <code>public.sellers</code> : <b>{sellers.length}</b>
+        </div>
+        <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+          <button onClick={refreshAll}>🔄 Recharger</button>
+          <button onClick={purgeCaches}>🧹 Vider caches</button>
         </div>
       </div>
 
-      {/* Planning de la semaine (menus interactifs pour ADMIN) */}
-      <div style={{ overflowX: "auto" }}>
-        <table>
-          <thead>
-            <tr>
-              <th style={{ textAlign: "left" }}>Jour</th>
-              {SLOTS.map(s => <th key={s}>{SLOT_LABEL[s]}</th>)}
-            </tr>
-          </thead>
-          <tbody>
-            {weekDays.map(d => (
-              <tr key={d} style={{ background: d === todayStr ? "#e3f2fd" : "transparent" }}>
-                <td><strong>{d}</strong></td>
-                {SLOTS.map(s => {
-                  const selId = getSellerId(d, s)
-                  const selName = selId ? (sellersById[selId]?.name || "?") : ""
-                  const col = selId ? colorFor(selId) : "#f9f9f9"
-                  return (
-                    <td key={s}>
-                      {isAdmin ? (
-                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          <div style={{
-                            width: 10, height: 22, borderRadius: 4,
-                            background: selId ? col : "#eee", border: "1px solid #ddd"
-                          }} />
-                          <select
-                            disabled={busy}
-                            value={selId}
-                            onChange={(e) => setAssignment(d, s, e.target.value)}
-                          >
-                            <option value="">— (vide) —</option>
-                            {sellers.map(u => (
-                              <option key={u.id} value={u.id}>
-                                {u.name || u.email}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                      ) : (
-                        selName ? (
-                          <span style={{
-                            padding: "2px 6px",
-                            borderRadius: 6,
-                            background: col,
-                            border: "1px solid #bbb",
-                            display: "inline-block"
-                          }}>
-                            {selName}
-                          </span>
-                        ) : <span style={{ opacity: .6 }}>—</span>
-                      )}
-                    </td>
-                  )
-                })}
+      {errorMsg && (
+        <div style={{ background: '#fee2e2', border: '1px solid #fecaca', padding: 12, borderRadius: 8 }}>
+          Erreur : {errorMsg}
+        </div>
+      )}
+
+      {loading ? (
+        <div>Chargement…</div>
+      ) : (
+        <div style={{ overflow: 'auto' }}>
+          <table style={{ minWidth: 900, width: '100%', borderCollapse: 'collapse' }}>
+            <thead>
+              <tr>
+                <th style={{ border: '1px solid #e5e7eb', padding: '8px 12px', textAlign: 'left' }}>Créneau</th>
+                {days.map((d) => (
+                  <th key={d.date} style={{ border: '1px solid #e5e7eb', padding: '8px 12px', textAlign: 'left' }}>
+                    {d.label}
+                  </th>
+                ))}
               </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+            </thead>
+            <tbody>
+              {(['MORNING', 'AFTERNOON', 'EVENING'] as Slot[]).map((slot) => (
+                <tr key={slot}>
+                  <td style={{ border: '1px solid #e5e7eb', padding: '8px 12px', fontWeight: 500 }}>
+                    {SLOT_LABEL[slot]}
+                  </td>
+                  {days.map((d) => {
+                    const value = currentSellerId(d.date, slot)
+                    return (
+                      <td key={d.date} style={{ border: '1px solid #e5e7eb', padding: '6px 8px' }}>
+                        <select
+                          style={{ width: '100%' }}
+                          value={value}
+                          onChange={(e) => {
+                            const v = e.target.value
+                            assignSeller(d.date, slot, v === '' ? null : v)
+                          }}
+                        >
+                          <option value="">— Non affecté —</option>
+                          {sellers.map((s) => (
+                            <option key={s.id} value={s.id}>
+                              {s.full_name}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                    )
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   )
 }
