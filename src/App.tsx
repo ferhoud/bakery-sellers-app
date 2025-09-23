@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useState } from "react"
+import React, { useEffect, useState } from "react"
 import { supabase } from "./supabaseClient"
 import Schedule from "./components/Schedule"
 import Tabs from "./components/Tabs"
@@ -59,18 +59,33 @@ function AuthView() {
       <p style={{ marginTop: 0, opacity: 0.8, fontSize: 14 }}>
         Entre ton <strong>identifiant</strong> (ex: <code>leila</code>) et ton <strong>code</strong>.
       </p>
+
       <form onSubmit={signInOrUp} style={{ display: "grid", gap: 8 }}>
-        <input placeholder="Identifiant (ex: leila)" value={username} onChange={(e) => setUsername(e.target.value)} />
-        <input type="password" placeholder="Code (min. 6 caractères)" value={code} onChange={(e) => setCode(e.target.value)} />
-        <button disabled={loading} type="submit">{loading ? "Connexion..." : "Se connecter"}</button>
+        <input
+          placeholder="Identifiant (ex: leila)"
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+        />
+        <input
+          type="password"
+          placeholder="Code (min. 6 caractères)"
+          value={code}
+          onChange={(e) => setCode(e.target.value)}
+        />
+        <button disabled={loading} type="submit">
+          {loading ? "Connexion..." : "Se connecter"}
+        </button>
       </form>
+
       {error && <p style={{ color: "crimson" }}>{error}</p>}
+
       <p style={{ fontSize: 12, opacity: 0.7, marginTop: 8 }}>
         L’identifiant est converti en e-mail technique <code>{`{identifiant}@vendeuses.local`}</code>.
       </p>
     </div>
   )
 }
+
 export default function App() {
   const [session, setSession] = useState<SessionLike>(null)
   const [ready, setReady] = useState(false)
@@ -95,9 +110,17 @@ export default function App() {
     ;(async () => {
       const email = session.user?.email
       if (!email) return
-      const { data: me } = await supabase.from("sellers").select("id,name,email,username,role").eq("email", email).single()
+      const { data: me } = await supabase
+        .from("sellers")
+        .select("id,name,email,username,role")
+        .eq("email", email)
+        .single()
       setCurrentSeller(me || null)
-      const { data: s } = await supabase.from("sellers").select("id,name,email,username,role").order("name", { ascending: true })
+
+      const { data: s } = await supabase
+        .from("sellers")
+        .select("id,name,email,username,role")
+        .order("name", { ascending: true })
       setSellers(s || [])
     })()
   }, [session])
@@ -111,7 +134,10 @@ export default function App() {
   return (
     <div style={{ padding: 16, fontFamily: "system-ui" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-        <div><strong>Connecté :</strong> {currentSeller?.name || session.user.email}{isAdmin ? " (admin)" : ""}</div>
+        <div>
+          <strong>Connecté :</strong> {currentSeller?.name || session.user.email}
+          {isAdmin ? " (admin)" : ""}
+        </div>
         <button onClick={logout}>Se déconnecter</button>
       </div>
 
@@ -121,7 +147,9 @@ export default function App() {
       {tab === "admin" && (
         <div style={{ marginTop: 16 }}>
           <h2>Admin</h2>
-          <p style={{ opacity: 0.8 }}>Zone réservée à l’admin. (exports, remplacements, notifications…)</p>
+          <p style={{ opacity: 0.8 }}>
+            Zone réservée à l’admin. Ici on pourra ajouter : export des heures, gestion des remplacements, notifications, etc.
+          </p>
         </div>
       )}
     </div>
