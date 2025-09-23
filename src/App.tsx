@@ -3,6 +3,7 @@ import { supabase } from "./supabaseClient"
 import Schedule from "./components/Schedule"
 import Tabs from "./components/Tabs"
 import Absences from "./components/Absences"
+import AdminRemplacements from "./components/AdminRemplacements"
 
 type SessionLike = any
 
@@ -16,70 +17,43 @@ type Seller = {
 
 type TabKey = "planning" | "absences" | "admin"
 
-/** Connexion: accepte soit un identifiant (=> identifiant@vendeuses.local), soit un e-mail */
+/** Connexion: identifiant OU e-mail */
 function AuthView() {
-  const [login, setLogin] = useState("") // identifiant OU e-mail
-  const [password, setPassword] = useState("") // code ou mot de passe
+  const [login, setLogin] = useState("")
+  const [password, setPassword] = useState("")
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
 
-  const toEmailFromLogin = (v: string) => {
-    const t = v.trim()
-    // Si l'utilisateur saisit un e-mail, on le prend tel quel
-    if (t.includes("@")) return t.toLowerCase()
-    // Sinon, on convertit l'identifiant en e-mail technique
-    return `${t.toLowerCase()}@vendeuses.local`
-  }
-
+  const toEmailFromLogin = (v: string) => v.includes("@") ? v.trim().toLowerCase() : `${v.trim().toLowerCase()}@vendeuses.local`
   const isEmail = (v: string) => v.trim().includes("@")
 
   const signInOrUp = async (e: React.FormEvent) => {
     e.preventDefault()
     setError(null)
-
     const raw = login.trim()
     if (!raw) { setError("Renseigne l’identifiant ou l’e-mail."); return }
     if (password.length < 6) { setError("Le mot de passe / code doit contenir au moins 6 caractères."); return }
 
     setLoading(true)
     const email = toEmailFromLogin(raw)
+    const { error: signInError } = await supabase.auth.signInWithPassword({ email, password })
 
-    // 1) Tenter la connexion
-    const { error: signInError } = await supabase.auth.signInWithPassword({
-      email,
-      password
-    })
-
-    // 2) Si échec et QUE l'utilisateur a saisi un identifiant (pas d'@), on l'inscrit automatiquement
-    if (signInError && !isEmail(raw)) {
-      const { error: signUpError } = await supabase.auth.signUp({ email, password })
-      if (signUpError) {
-        setError(signUpError.message)
+    if (signInError) {
+      // Si identifiant (pas d'@) -> inscription auto, sinon on refuse (email)
+      if (!isEmail(raw)) {
+        const { error: signUpError } = await supabase.auth.signUp({ email, password })
+        if (signUpError) { setError(signUpError.message); setLoading(false); return }
+        try {
+          await supabase.from("sellers").insert({ name: raw, username: raw.toLowerCase(), email }).select().single()
+        } catch {}
+        const { error: signInError2 } = await supabase.auth.signInWithPassword({ email, password })
+        if (signInError2) { setError(signInError2.message); setLoading(false); return }
+      } else {
+        setError("E-mail ou mot de passe incorrect.")
         setLoading(false)
         return
       }
-      // Créer/compléter la fiche vendeuse
-      try {
-        await supabase
-          .from("sellers")
-          .insert({ name: raw, username: raw.toLowerCase(), email })
-          .select()
-          .single()
-      } catch {}
-      // Reconnexion après inscription
-      const { error: signInError2 } = await supabase.auth.signInWithPassword({ email, password })
-      if (signInError2) {
-        setError(signInError2.message)
-        setLoading(false)
-        return
-      }
-    } else if (signInError && isEmail(raw)) {
-      // En mode e-mail, on n'inscrit pas automatiquement (sécurité)
-      setError("E-mail ou mot de passe incorrect.")
-      setLoading(false)
-      return
     }
-
     setLoading(false)
   }
 
@@ -87,33 +61,15 @@ function AuthView() {
     <div style={{ maxWidth: 380, margin: "64px auto", fontFamily: "system-ui" }}>
       <h1 style={{ marginBottom: 8 }}>Connexion vendeuse — v16</h1>
       <p style={{ marginTop: 0, opacity: 0.8, fontSize: 14 }}>
-        Tu peux entrer <strong>soit</strong> un <strong>identifiant</strong> (ex: <code>leila</code>) <strong>soit</strong> un <strong>e-mail</strong>.<br />
-        Mot de passe = ton <strong>code</strong> (au moins 6 caractères) ou ton <strong>mot de passe</strong>.
+        Entre un <strong>identifiant</strong> (ex: <code>leila</code>) ou un <strong>e-mail</strong>.
       </p>
 
       <form onSubmit={signInOrUp} style={{ display: "grid", gap: 8 }}>
-        <input
-          placeholder="Identifiant (ex: leila) ou e-mail"
-          value={login}
-          onChange={(e) => setLogin(e.target.value)}
-        />
-        <input
-          type="password"
-          placeholder="Code / mot de passe"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-        />
-        <button disabled={loading} type="submit">
-          {loading ? "Connexion..." : "Se connecter"}
-        </button>
+        <input placeholder="Identifiant ou e-mail" value={login} onChange={(e) => setLogin(e.target.value)} />
+        <input type="password" placeholder="Code / mot de passe (≥ 6)" value={password} onChange={(e) => setPassword(e.target.value)} />
+        <button disabled={loading} type="submit">{loading ? "Connexion..." : "Se connecter"}</button>
       </form>
-
       {error && <p style={{ color: "crimson" }}>{error}</p>}
-
-      <p style={{ fontSize: 12, opacity: 0.7, marginTop: 8 }}>
-        Si tu saisis un identifiant sans <code>@</code>, il sera converti en <code>{`{identifiant}@vendeuses.local`}</code>.{" "}
-        En mode e-mail, aucune inscription automatique n’est faite.
-      </p>
     </div>
   )
 }
@@ -133,9 +89,7 @@ export default function App() {
       setSession(data.session)
       setReady(true)
     })()
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, newSession) => {
-      setSession(newSession)
-    })
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, newSession) => { setSession(newSession) })
     return () => { sub.subscription.unsubscribe() }
   }, [])
 
@@ -144,17 +98,9 @@ export default function App() {
     ;(async () => {
       const email = session.user?.email
       if (!email) return
-      const { data: me } = await supabase
-        .from("sellers")
-        .select("id,name,email,username,role")
-        .eq("email", email)
-        .single()
+      const { data: me } = await supabase.from("sellers").select("id,name,email,username,role").eq("email", email).single()
       setCurrentSeller(me || null)
-
-      const { data: s } = await supabase
-        .from("sellers")
-        .select("id,name,email,username,role")
-        .order("name", { ascending: true })
+      const { data: s } = await supabase.from("sellers").select("id,name,email,username,role").order("name", { ascending: true })
       setSellers(s || [])
     })()
   }, [session])
@@ -169,23 +115,16 @@ export default function App() {
     <div style={{ padding: 16, fontFamily: "system-ui" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
         <div>
-          <strong>Connecté :</strong> {currentSeller?.name || session.user.email}
-          {isAdmin ? " (admin)" : ""}
+          <strong>Connecté :</strong> {currentSeller?.name || session.user.email}{isAdmin ? " (admin)" : ""}
         </div>
         <button onClick={logout}>Se déconnecter</button>
       </div>
 
       <Tabs value={tab} onChange={setTab} isAdmin={!!isAdmin} />
+
       {tab === "planning" && <Schedule isAdmin={!!isAdmin} />}
       {tab === "absences" && <Absences currentSeller={currentSeller} isAdmin={!!isAdmin} sellers={sellers} />}
-      {tab === "admin" && (
-        <div style={{ marginTop: 16 }}>
-          <h2>Admin</h2>
-          <p style={{ opacity: 0.8 }}>
-            Zone réservée à l’admin (exports d’heures, remplacements, notifications…)
-          </p>
-        </div>
-      )}
+      {tab === "admin" && <AdminRemplacements currentSeller={currentSeller} sellers={sellers} isAdmin={!!isAdmin} />}
     </div>
   )
 }
