@@ -1,59 +1,115 @@
 import React, { useEffect, useMemo, useState } from "react"
 import { supabase } from "../supabaseClient"
 
-type Seller = { id: string; name: string; email: string; role?: string }
-type Shift = { id?: string; day: string; slot: "open" | "mid" | "close"; seller_id: string }
-type Absence = {
-  id: string; seller_id: string; day: string; slot: "open" | "mid" | "close";
-  status: string; replacement_seller_id?: string | null;
-  owner?: { id: string; name: string | null } | null
-  replacement?: { id: string; name: string | null } | null
-}
-
+// Libellés des créneaux
 const SLOT_LABEL: Record<string, string> = {
   open: "Matin (06:30–13:30)",
   mid: "Renfort (07:00–13:00)",
   close: "Après-midi (13:30–20:30)"
 }
+type SlotKey = "open" | "mid" | "close"
+const SLOTS: SlotKey[] = ["open", "mid", "close"]
+
+type Seller = { id: string; name: string; email: string; role?: string }
+type ShiftRow = { id?: string; day: string; slot: SlotKey; seller_id: string }
+type AbsenceRow = {
+  id: string
+  seller_id: string
+  day: string
+  slot: SlotKey
+  status: "pending" | "candidate" | "approved" | "rejected" | "cancelled"
+  replacement_seller_id?: string | null
+  created_at?: string
+  owner?: { id: string; name: string | null } | null
+  replacement?: { id: string; name: string | null } | null
+}
+
+function toISODate(d: Date) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).toISOString().slice(0, 10)
+}
+
+// Couleur stable par vendeuse
+const PALETTE = [
+  "#EF9A9A", "#F48FB1", "#CE93D8", "#B39DDB",
+  "#90CAF9", "#80DEEA", "#A5D6A7", "#E6EE9C",
+  "#FFCC80", "#FFAB91", "#BCAAA4", "#B0BEC5"
+]
+function colorFor(id: string) {
+  let h = 0
+  for (let i = 0; i < id.length; i++) h = (h << 5) - h + id.charCodeAt(i)
+  const idx = Math.abs(h) % PALETTE.length
+  return PALETTE[idx]
+}
 
 export default function Schedule({ isAdmin }: { isAdmin: boolean }) {
   const [sellers, setSellers] = useState<Seller[]>([])
-  const [shifts, setShifts] = useState<Shift[]>([])
-  const [todayAbs, setTodayAbs] = useState<Absence[]>([])
+  const [shifts, setShifts] = useState<ShiftRow[]>([])
+  const [todayAbsences, setTodayAbsences] = useState<AbsenceRow[]>([])
+  const [busy, setBusy] = useState(false)
   const sellersById = useMemo(() => Object.fromEntries(sellers.map(s => [s.id, s])), [sellers])
 
-  const todayStr = new Date().toISOString().slice(0, 10)
+  // Semaine (lundi → dimanche)
+  const base = new Date()
+  const weekStart = new Date(base)
+  weekStart.setDate(base.getDate() - ((base.getDay() + 6) % 7)) // lundi
+  const weekDays: string[] = Array.from({ length: 7 }, (_, i) => toISODate(new Date(weekStart.getTime() + i * 86400000)))
+  const todayStr = toISODate(new Date())
 
+  // Accès rapide aux shifts par (day|slot)
+  const keyOf = (day: string, slot: SlotKey) => `${day}|${slot}`
+  const mapShifts = useMemo(() => {
+    const m = new Map<string, ShiftRow>()
+    shifts.forEach(s => m.set(keyOf(s.day, s.slot), s))
+    return m
+  }, [shifts])
+
+  function getSellerId(day: string, slot: SlotKey) {
+    const row = mapShifts.get(keyOf(day, slot))
+    return row?.seller_id || ""
+  }
+  function getSellerName(day: string, slot: SlotKey) {
+    const id = getSellerId(day, slot)
+    return id ? (sellersById[id]?.name || "?") : ""
+  }
+
+  // Empêcher une double affectation d’une vendeuse le même jour (1 seul créneau par jour)
+  function alreadyAssignedThisDay(sellerId: string, day: string, exceptSlot?: SlotKey) {
+    if (!sellerId) return false
+    return SLOTS.some(sl => {
+      if (sl === exceptSlot) return false
+      const r = mapShifts.get(keyOf(day, sl))
+      return r?.seller_id === sellerId
+    })
+  }
+
+  // Charger données
   async function loadAll() {
     // vendeuses
     const { data: s } = await supabase.from("sellers").select("id,name,email,role").order("name", { ascending: true })
     setSellers(s || [])
 
-    // shifts de la semaine en cours
-    const base = new Date()
-    const start = new Date(base); start.setDate(base.getDate() - base.getDay() + 1) // Lundi
-    const end = new Date(start); end.setDate(start.getDate() + 7)
-    const startStr = start.toISOString().slice(0, 10)
-    const endStr = end.toISOString().slice(0, 10)
-
+    // shifts (semaine)
+    const startStr = weekDays[0]
+    const endStr = toISODate(new Date(new Date(weekDays[6]).getTime() + 86400000)) // lundi suivant (exclu)
     const { data: sh } = await supabase
       .from("shifts")
       .select("id, day, slot, seller_id")
-      .gte("day", startStr).lt("day", endStr)
+      .gte("day", startStr)
+      .lt("day", endStr)
       .order("day", { ascending: true })
     setShifts((sh as any) || [])
 
-    // absences du jour (avec noms joints)
+    // absences du jour (avec noms joints pour éviter “?”)
     const { data: abs } = await supabase
       .from("absences")
       .select(`
-        id, seller_id, day, slot, status, replacement_seller_id,
+        id, seller_id, day, slot, status, replacement_seller_id, created_at,
         owner:seller_id ( id, name ),
         replacement:replacement_seller_id ( id, name )
       `)
       .eq("day", todayStr)
       .order("created_at", { ascending: true })
-    setTodayAbs((abs as any) || [])
+    setTodayAbsences((abs as any) || [])
   }
 
   useEffect(() => {
@@ -66,34 +122,50 @@ export default function Schedule({ isAdmin }: { isAdmin: boolean }) {
     return () => { supabase.removeChannel(ch) }
   }, [])
 
-  // rendu simple : tableau 7 jours × 3 créneaux
-  const days: string[] = (() => {
-    const arr: string[] = []
-    const base = new Date()
-    const start = new Date(base); start.setDate(base.getDate() - base.getDay() + 1) // lundi
-    for (let i = 0; i < 7; i++) {
-      const d = new Date(start); d.setDate(start.getDate() + i)
-      arr.push(d.toISOString().slice(0, 10))
-    }
-    return arr
-  })()
-  const slots: Array<"open" | "mid" | "close"> = ["open", "mid", "close"]
+  // Affectation / désaffectation
+  async function setAssignment(day: string, slot: SlotKey, sellerId: string) {
+    if (!isAdmin) return
+    setBusy(true)
+    try {
+      // Empêche 2 créneaux le même jour pour la même vendeuse
+      if (sellerId && alreadyAssignedThisDay(sellerId, day, slot)) {
+        alert("Cette vendeuse est déjà affectée à un autre créneau le même jour.")
+        setBusy(false)
+        return
+      }
 
-  const getShiftSellerName = (day: string, slot: "open" | "mid" | "close") => {
-    const row = shifts.find(s => s.day === day && s.slot === slot)
-    if (!row) return ""
-    return sellersById[row.seller_id]?.name || "?"
+      const existing = mapShifts.get(keyOf(day, slot))
+      if (!sellerId) {
+        // suppression
+        if (existing?.id) {
+          await supabase.from("shifts").delete().eq("id", existing.id)
+        }
+      } else if (existing?.id) {
+        await supabase.from("shifts").update({ seller_id: sellerId }).eq("id", existing.id)
+      } else {
+        await supabase.from("shifts").insert({ day, slot, seller_id: sellerId })
+      }
+      // recharger
+      await loadAll()
+    } finally {
+      setBusy(false)
+    }
   }
+
+  // Bandeau “planning du jour” (ruban long)
+  const todayOpen = getSellerId(todayStr, "open")
+  const todayMid = getSellerId(todayStr, "mid")
+  const todayClose = getSellerId(todayStr, "close")
 
   return (
     <div style={{ display: "grid", gap: 16 }}>
-      {/* 🚨 Absences du jour (toujours en PREMIER) */}
+      {/* 1) Absences du jour (toujours en PREMIER) */}
       <div style={{ border: "2px solid #ffc107", background: "#fff8e1", borderRadius: 10, padding: 12 }}>
         <h3 style={{ margin: 0, marginBottom: 8 }}>Absences du jour</h3>
-        {todayAbs.length === 0 && <div>Aucune absence aujourd’hui.</div>}
-        {todayAbs.map(a => {
+        {todayAbsences.length === 0 && <div>Aucune absence aujourd’hui.</div>}
+        {todayAbsences.map(a => {
           const ownerName = a.owner?.name ?? sellersById[a.seller_id]?.name ?? "?"
-          const replName  = a.replacement?.name ?? (a.replacement_seller_id ? (sellersById[a.replacement_seller_id!]?.name ?? "?") : null)
+          const replName  = a.replacement?.name ?? (a.replacement_seller_id ? (sellersById[a.replacement_seller_id]?.name ?? "?") : null)
           return (
             <div key={a.id} style={{ padding: 8, border: "1px solid #ffe082", background: "#fffde7", borderRadius: 8, marginBottom: 8 }}>
               <strong>{ownerName}</strong> — <em>{SLOT_LABEL[a.slot]}</em>
@@ -111,24 +183,121 @@ export default function Schedule({ isAdmin }: { isAdmin: boolean }) {
         })}
       </div>
 
-      {/* Planning semaine */}
+      {/* 2) Ruban “planning du jour” (06:30→20:30) */}
+      <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12 }}>
+        <h3 style={{ marginTop: 0, marginBottom: 8 }}>Planning du jour — {todayStr}</h3>
+        <div style={{ display: "flex", gap: 6, alignItems: "stretch" }}>
+          {/* open 7h */}
+          <div
+            style={{
+              flex: 7,
+              minHeight: 44,
+              borderRadius: 8,
+              border: "1px solid #ccc",
+              background: todayOpen ? colorFor(todayOpen) : "#f6f6f6",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              color: todayOpen ? "#000" : "#888",
+              fontWeight: 600
+            }}
+            title={SLOT_LABEL.open}
+          >
+            {todayOpen ? (sellersById[todayOpen]?.name || "?") : "—"}
+          </div>
+          {/* mid 6h */}
+          <div
+            style={{
+              flex: 6,
+              minHeight: 44,
+              borderRadius: 8,
+              border: "1px solid #ccc",
+              background: todayMid ? colorFor(todayMid) : "#f6f6f6",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              color: todayMid ? "#000" : "#888",
+              fontWeight: 600
+            }}
+            title={SLOT_LABEL.mid}
+          >
+            {todayMid ? (sellersById[todayMid]?.name || "?") : "—"}
+          </div>
+          {/* close 7h */}
+          <div
+            style={{
+              flex: 7,
+              minHeight: 44,
+              borderRadius: 8,
+              border: "1px solid #ccc",
+              background: todayClose ? colorFor(todayClose) : "#f6f6f6",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              color: todayClose ? "#000" : "#888",
+              fontWeight: 600
+            }}
+            title={SLOT_LABEL.close}
+          >
+            {todayClose ? (sellersById[todayClose]?.name || "?") : "—"}
+          </div>
+        </div>
+      </div>
+
+      {/* 3) Planning de la semaine (menu interactif rétabli) */}
       <div style={{ overflowX: "auto" }}>
         <table>
           <thead>
             <tr>
               <th style={{ textAlign: "left" }}>Jour</th>
-              {slots.map(s => <th key={s}>{SLOT_LABEL[s]}</th>)}
+              {SLOTS.map(s => <th key={s}>{SLOT_LABEL[s]}</th>)}
             </tr>
           </thead>
           <tbody>
-            {days.map(d => (
+            {weekDays.map(d => (
               <tr key={d} style={{ background: d === todayStr ? "#e3f2fd" : "transparent" }}>
                 <td><strong>{d}</strong></td>
-                {slots.map(s => (
-                  <td key={s}>
-                    {getShiftSellerName(d, s) || <span style={{ opacity: .6 }}>—</span>}
-                  </td>
-                ))}
+                {SLOTS.map(s => {
+                  const selId = getSellerId(d, s)
+                  const selName = selId ? (sellersById[selId]?.name || "?") : ""
+                  const col = selId ? colorFor(selId) : "#f9f9f9"
+                  return (
+                    <td key={s}>
+                      {isAdmin ? (
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <div style={{
+                            width: 10, height: 22, borderRadius: 4,
+                            background: selId ? col : "#eee", border: "1px solid #ddd"
+                          }} />
+                          <select
+                            disabled={busy}
+                            value={selId}
+                            onChange={(e) => setAssignment(d, s, e.target.value)}
+                          >
+                            <option value="">— (vide) —</option>
+                            {sellers.map(u => (
+                              <option key={u.id} value={u.id}>
+                                {u.name || u.email}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      ) : (
+                        selName ? (
+                          <span style={{
+                            padding: "2px 6px",
+                            borderRadius: 6,
+                            background: col,
+                            border: "1px solid #bbb",
+                            display: "inline-block"
+                          }}>
+                            {selName}
+                          </span>
+                        ) : <span style={{ opacity: .6 }}>—</span>
+                      )}
+                    </td>
+                  )
+                })}
               </tr>
             ))}
           </tbody>
