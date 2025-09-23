@@ -10,7 +10,6 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
 )
 
 // 🔕 PWA désactivée TEMPORAIREMENT pour forcer l'UI à jour
-// (on remettra le register('/sw-v5.js') après vérification)
 if (false && import.meta.env.PROD && "serviceWorker" in navigator) {
   window.addEventListener("load", () => {
     navigator.serviceWorker.register("/sw-v5.js")
