@@ -84,13 +84,12 @@ export default function App() {
 
   // Toasts notifications (in-app)
   const [toasts, setToasts] = useState<{ id: string; title?: string; body?: string }[]>([])
-
   const pushToast = (t: { id: string; title?: string; body?: string }) => {
     setToasts((prev) => [...prev, t])
     setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== t.id)), 6000)
   }
 
-  // Déconnexion FORTE
+  // Déconnexion FORTE (efface session + caches + SW)
   const hardLogout = async () => {
     try {
       await supabase.auth.signOut({ scope: "global" } as any).catch(() => supabase.auth.signOut())
@@ -114,9 +113,7 @@ export default function App() {
   // ?logout=1 -> déconnexion forte
   useEffect(() => {
     const p = new URLSearchParams(location.search)
-    if (p.get("logout") === "1") {
-      hardLogout()
-    }
+    if (p.get("logout") === "1") { hardLogout() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -135,19 +132,44 @@ export default function App() {
     return () => { sub.subscription.unsubscribe() }
   }, [])
 
-  // Chargement profil + liste vendeuses
+  // Profil + auto-création seller si absent + liste vendeuses
   useEffect(() => {
     if (!session) { setCurrentSeller(null); return }
     ;(async () => {
       const email = session.user?.email
       if (!email) return
-      const { data: me } = await supabase
+
+      // 1) Tenter de charger la fiche seller
+      let { data: me } = await supabase
         .from("sellers")
         .select("id,name,email,username,role")
         .eq("email", email)
-        .single()
+        .maybeSingle()
+
+      // 2) Si absente -> la créer automatiquement
+      if (!me) {
+        const displayName = (email.split("@")[0] || "Vendeuse").replace(/[._-]/g, " ")
+        try {
+          const { data: created } = await supabase
+            .from("sellers")
+            .insert({ name: displayName, username: email.split("@")[0].toLowerCase(), email })
+            .select("id,name,email,username,role")
+            .single()
+          me = created || null
+        } catch {
+          // Si la création échoue (contrainte), on réessaie un select strict
+          const { data: me2 } = await supabase
+            .from("sellers")
+            .select("id,name,email,username,role")
+            .eq("email", email)
+            .single()
+          me = me2 || null
+        }
+      }
+
       setCurrentSeller(me || null)
 
+      // 3) Charger la liste complète (pour notifications & écrans)
       const { data: s } = await supabase
         .from("sellers")
         .select("id,name,email,username,role")
