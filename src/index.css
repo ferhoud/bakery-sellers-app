@@ -1,0 +1,8 @@
+:root { --bg:#ffffff; --text:#222; }
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--text);
+       font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+input, select, button { font-size: 14px; padding: 6px 8px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 6px; }
