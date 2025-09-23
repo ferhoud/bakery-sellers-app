@@ -8,6 +8,18 @@ const SLOT_LABEL: Record<string, string> = {
 }
 
 type Seller = { id: string; name: string; email: string; username?: string; role?: string }
+type AbsenceRow = {
+  id: string
+  seller_id: string
+  day: string
+  slot: "open" | "mid" | "close"
+  reason?: string | null
+  status: "pending" | "candidate" | "approved" | "rejected" | "cancelled"
+  replacement_seller_id?: string | null
+  created_at: string
+  owner?: { id: string; name: string | null } | null
+  replacement?: { id: string; name: string | null } | null
+}
 
 export default function Absences({
   currentSeller,
@@ -20,9 +32,10 @@ export default function Absences({
 }) {
   const me = currentSeller
   const [loading, setLoading] = useState(false)
-  const [list, setList] = useState<any[]>([])
+  const [list, setList] = useState<AbsenceRow[]>([])
   const [responses, setResponses] = useState<Record<string, "yes" | "no">>({})
-  const [sent, setSent] = useState(false) // ⬅️ bandeau “Demande envoyée ✅”
+  const [sent, setSent] = useState(false)
+  const [errorMsg, setErrorMsg] = useState<string | null>(null)
 
   // Formulaire
   const [day, setDay] = useState<string>("")
@@ -37,30 +50,38 @@ export default function Absences({
 
   async function loadAll() {
     setLoading(true)
-    const { data: abs } = await supabase
+
+    // 🔎 On joint les noms pour éviter les "?"
+    const fromDate = new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10)
+    const { data: abs, error } = await supabase
       .from("absences")
-      .select("*")
-      .gte("day", new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10))
+      .select(`
+        id, seller_id, day, slot, reason, status, replacement_seller_id, created_at,
+        owner:seller_id ( id, name ),
+        replacement:replacement_seller_id ( id, name )
+      `)
+      .gte("day", fromDate)
       .order("day", { ascending: true })
       .order("created_at", { ascending: true })
 
-    setList(abs || [])
+    if (error) console.error("LOAD absences error:", error)
+    setList((abs as any) || [])
 
-    if (me?.id) {
-      const ids = (abs || []).map((a) => a.id)
-      if (ids.length) {
-        const { data: resp } = await supabase
-          .from("absence_responses")
-          .select("absence_id, will_replace")
-          .in("absence_id", ids)
-          .eq("seller_id", me.id)
-        const map: Record<string, "yes" | "no"> = {}
-        resp?.forEach((r) => (map[r.absence_id] = r.will_replace ? "yes" : "no"))
-        setResponses(map)
-      } else {
-        setResponses({})
-      }
+    if (me?.id && abs?.length) {
+      const ids = (abs as AbsenceRow[]).map((a) => a.id)
+      const { data: resp, error: e2 } = await supabase
+        .from("absence_responses")
+        .select("absence_id, will_replace")
+        .in("absence_id", ids)
+        .eq("seller_id", me.id)
+      if (e2) console.error("LOAD responses error:", e2)
+      const map: Record<string, "yes" | "no"> = {}
+      resp?.forEach((r: any) => (map[r.absence_id] = r.will_replace ? "yes" : "no"))
+      setResponses(map)
+    } else {
+      setResponses({})
     }
+
     setLoading(false)
   }
 
@@ -82,80 +103,72 @@ export default function Absences({
   }, [me?.id])
 
   async function askAbsence() {
-    if (!me?.id || !day || !slot) return
+    setErrorMsg(null); setSent(false)
+    if (!me?.id) { setErrorMsg("Votre profil n’est pas prêt. Déconnectez-vous puis reconnectez-vous."); return }
+    if (!day || !slot) { setErrorMsg("Choisissez le jour et le créneau."); return }
+
     setLoading(true)
+    const insert = { seller_id: me.id, day, slot, reason, status: "pending" as const }
+    const { data: a, error } = await supabase.from("absences").insert(insert).select().single()
+    if (error) { setErrorMsg(error.message); setLoading(false); return }
 
-    const { data: a, error } = await supabase
-      .from("absences")
-      .insert({ seller_id: me.id, day, slot, reason, status: "pending" })
-      .select()
-      .single()
-    if (error) { alert(error.message); setLoading(false); return }
-
-    // ✅ Notifier TOUT LE MONDE (y compris l’admin et éventuellement le demandeur)
+    // 🔔 Notifier TOUT LE MONDE (admin compris)
     try {
-      const recipients = sellers // pas de filtre — tout le monde
-      if (recipients.length) {
-        await supabase.from("notifications").insert(
-          recipients.map((r) => ({
-            recipient_id: r.id,
-            kind: "absence_request",
-            title: "Demande d’absence",
-            body: `${me.name || "Une vendeuse"} demande une absence le ${a.day} – ${SLOT_LABEL[a.slot]}`,
-            data: { absence_id: a.id }
-          }))
-        )
-      }
+      const rows = sellers.map((r) => ({
+        recipient_id: r.id,
+        kind: "absence_request",
+        title: "Demande d’absence",
+        body: `${me.name || "Une vendeuse"} demande une absence le ${a.day} – ${SLOT_LABEL[a.slot]}`,
+        data: { absence_id: a.id }
+      }))
+      if (rows.length) await supabase.from("notifications").insert(rows)
     } catch {}
 
-    // UI : “Demande envoyée ✅”
     setSent(true)
-    setDay("")
-    setSlot("open")
-    setReason("")
+    setDay(""); setSlot("open"); setReason("")
     setLoading(false)
-    // Masquer le bandeau après 4s
     setTimeout(() => setSent(false), 4000)
   }
 
-  async function respond(absence: any, willReplace: boolean) {
-    if (!me?.id) return
-    await supabase
+  async function respond(absence: AbsenceRow, willReplace: boolean) {
+    setErrorMsg(null)
+    if (!me?.id) { setErrorMsg("Profil vendeur introuvable."); return }
+
+    const { error } = await supabase
       .from("absence_responses")
       .upsert({ absence_id: absence.id, seller_id: me.id, will_replace: willReplace })
+    if (error) { setErrorMsg(error.message); return }
 
-    // Notifier l’admin si quelqu’un dit OUI
     if (willReplace) {
       const admin = sellers.find((s) => s.role === "admin")
       if (admin) {
-        try {
-          await supabase.from("notifications").insert({
-            recipient_id: admin.id,
-            kind: "replacement_candidate",
-            title: "Candidature remplacement",
-            body: `${me.name || "Une vendeuse"} peut remplacer le ${absence.day} – ${SLOT_LABEL[absence.slot]}`,
-            data: { absence_id: absence.id, candidate_id: me.id }
-          })
-        } catch {}
+        await supabase.from("notifications").insert({
+          recipient_id: admin.id,
+          kind: "replacement_candidate",
+          title: "Candidature remplacement",
+          body: `${me.name || "Une vendeuse"} peut remplacer le ${absence.day} – ${SLOT_LABEL[absence.slot]}`,
+          data: { absence_id: absence.id, candidate_id: me.id }
+        }).catch(() => {})
       }
-      // Marquer l’absence en "candidate"
       await supabase.from("absences").update({ status: "candidate" }).eq("id", absence.id)
     }
   }
 
   return (
     <div style={{ display: "grid", gap: 16 }}>
-      {/* Bandeau confirmation */}
+      {/* Bandeaux */}
       {sent && (
-        <div style={{
-          padding: 10, border: "1px solid #c8e6c9", background: "#e8f5e9",
-          color: "#256029", borderRadius: 8
-        }}>
+        <div style={{ padding: 10, border: "1px solid #c8e6c9", background: "#e8f5e9", color: "#256029", borderRadius: 8 }}>
           Demande envoyée ✅ — tout le monde a été notifié.
         </div>
       )}
+      {errorMsg && (
+        <div style={{ padding: 10, border: "1px solid #ffcdd2", background: "#ffebee", color: "#b71c1c", borderRadius: 8 }}>
+          {errorMsg}
+        </div>
+      )}
 
-      {/* Créer une absence */}
+      {/* Formulaire */}
       <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12 }}>
         <h3 style={{ margin: 0, marginBottom: 8 }}>Demander une absence</h3>
         <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr", alignItems: "center" }}>
@@ -178,7 +191,7 @@ export default function Absences({
         />
         <div>
           <button disabled={loading || !day} onClick={askAbsence} style={{ marginTop: 8 }}>
-            Envoyer la demande
+            {loading ? "Envoi..." : "Envoyer la demande"}
           </button>
         </div>
       </div>
@@ -190,56 +203,46 @@ export default function Absences({
         {!loading && list.length === 0 && <p>Aucune absence récente.</p>}
 
         {!loading && list.map((a) => {
-          const owner = sellersById[a.seller_id]
+          const ownerName = a.owner?.name ?? sellersById[a.seller_id]?.name ?? "?"
+          const replName  = a.replacement?.name ?? (a.replacement_seller_id ? (sellersById[a.replacement_seller_id]?.name ?? "?") : null)
           const mine = a.seller_id === me?.id
-          const already = responses[a.id] // "yes" | "no"
-          const canAnswer = !mine && a.status !== "approved"
+          // ❌ L’admin ne doit PAS voir la question “remplacer ?”
+          const canAnswer = !mine && !isAdmin && a.status !== "approved"
 
           return (
             <div key={a.id} style={{ padding: 8, border: "1px solid #eee", borderRadius: 8, marginBottom: 8 }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
                 <div>
-                  <strong>{owner?.name || "?"}</strong> — {a.day} — <em>{SLOT_LABEL[a.slot]}</em>
+                  <strong>{ownerName}</strong> — {a.day} — <em>{SLOT_LABEL[a.slot]}</em>
                   {" · "}
                   <span style={{ padding: "2px 6px", borderRadius: 6, border: "1px solid #ddd" }}>
                     {a.status === "pending" && "En attente"}
                     {a.status === "candidate" && "Candidate trouvée"}
                     {a.status === "approved" && "Validée"}
                     {a.status === "rejected" && "Refusée"}
+                    {a.status === "cancelled" && "Annulée"}
                   </span>
                 </div>
-                {a.replacement_seller_id && (
+                {replName && (
                   <div style={{ opacity: 0.8 }}>
-                    Remplacée par <strong>{sellersById[a.replacement_seller_id]?.name || "?"}</strong>
+                    Remplacée par <strong>{replName}</strong>
                   </div>
                 )}
               </div>
 
               {a.reason && <div style={{ marginTop: 6, opacity: 0.8 }}>Motif : {a.reason}</div>}
 
-              {/* Question “voulez-vous remplacer ?” */}
               {canAnswer && (
                 <div style={{ marginTop: 8 }}>
                   <div style={{ marginBottom: 6 }}>Voulez-vous remplacer ?</div>
                   <div style={{ display: "flex", gap: 8 }}>
-                    <button
-                      disabled={already === "yes"}
-                      onClick={() => respond(a, true)}
-                      style={{ borderColor: "#2e7d32", color: "#2e7d32" }}
-                    >
+                    <button onClick={() => respond(a, true)} style={{ borderColor: "#2e7d32", color: "#2e7d32" }}>
                       Oui
                     </button>
-                    <button
-                      disabled={already === "no"}
-                      onClick={() => respond(a, false)}
-                      style={{ borderColor: "#c62828", color: "#c62828" }}
-                    >
+                    <button onClick={() => respond(a, false)} style={{ borderColor: "#c62828", color: "#c62828" }}>
                       Non
                     </button>
                   </div>
-                  {already && <div style={{ marginTop: 6, fontSize: 12, opacity: 0.8 }}>
-                    Votre réponse : <strong>{already === "yes" ? "Oui" : "Non"}</strong>
-                  </div>}
                 </div>
               )}
             </div>
