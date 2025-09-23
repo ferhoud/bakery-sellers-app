@@ -10,7 +10,7 @@ const SLOT_LABEL: Record<string, string> = {
 type SlotKey = "open" | "mid" | "close"
 const SLOTS: SlotKey[] = ["open", "mid", "close"]
 
-type Seller = { id: string; name: string; email: string; role?: string }
+type Seller = { id: string; full_name: string; created_at: string }
 type ShiftRow = { id?: string; day: string; slot: SlotKey; seller_id: string }
 type AbsenceRow = {
   id: string
