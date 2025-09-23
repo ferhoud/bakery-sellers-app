@@ -21,6 +21,13 @@ type AbsenceRow = {
   replacement?: { id: string; name: string | null } | null
 }
 
+function ymdLocal(d: Date) {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, "0")
+  const day = String(d.getDate()).padStart(2, "0")
+  return `${y}-${m}-${day}`
+}
+
 export default function Absences({
   currentSeller,
   isAdmin,
@@ -31,11 +38,17 @@ export default function Absences({
   sellers: Seller[]
 }) {
   const me = currentSeller
+  const today = ymdLocal(new Date())
+
   const [loading, setLoading] = useState(false)
   const [list, setList] = useState<AbsenceRow[]>([])
   const [responses, setResponses] = useState<Record<string, "yes" | "no">>({})
   const [sent, setSent] = useState(false)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
+
+  // Filtres : aujourd’hui / à venir / toutes
+  type FilterKey = "today" | "upcoming" | "all"
+  const [filter, setFilter] = useState<FilterKey>("upcoming")
 
   // Formulaire
   const [day, setDay] = useState<string>("")
@@ -50,9 +63,10 @@ export default function Absences({
 
   async function loadAll() {
     setLoading(true)
+    // On charge -7 jours → +60 jours, et on affiche selon filtre côté client
+    const from = ymdLocal(new Date(Date.now() - 7 * 86400000))
+    const to = ymdLocal(new Date(Date.now() + 60 * 86400000))
 
-    // 🔎 On joint les noms pour éviter les "?"
-    const fromDate = new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10)
     const { data: abs, error } = await supabase
       .from("absences")
       .select(`
@@ -60,7 +74,8 @@ export default function Absences({
         owner:seller_id ( id, name ),
         replacement:replacement_seller_id ( id, name )
       `)
-      .gte("day", fromDate)
+      .gte("day", from)
+      .lte("day", to)
       .order("day", { ascending: true })
       .order("created_at", { ascending: true })
 
@@ -88,17 +103,17 @@ export default function Absences({
   useEffect(() => {
     loadAll()
     // Realtime
-    const ch1 = supabase
+    const chA = supabase
       .channel("absences-rt")
       .on("postgres_changes", { event: "*", schema: "public", table: "absences" }, loadAll)
       .subscribe()
-    const ch2 = supabase
+    const chR = supabase
       .channel("absence-resp-rt")
       .on("postgres_changes", { event: "*", schema: "public", table: "absence_responses" }, loadAll)
       .subscribe()
     return () => {
-      supabase.removeChannel(ch1)
-      supabase.removeChannel(ch2)
+      supabase.removeChannel(chA)
+      supabase.removeChannel(chR)
     }
   }, [me?.id])
 
@@ -112,7 +127,7 @@ export default function Absences({
     const { data: a, error } = await supabase.from("absences").insert(insert).select().single()
     if (error) { setErrorMsg(error.message); setLoading(false); return }
 
-    // 🔔 Notifier TOUT LE MONDE (admin compris)
+    // Notifier tout le monde
     try {
       const rows = sellers.map((r) => ({
         recipient_id: r.id,
@@ -133,6 +148,7 @@ export default function Absences({
   async function respond(absence: AbsenceRow, willReplace: boolean) {
     setErrorMsg(null)
     if (!me?.id) { setErrorMsg("Profil vendeur introuvable."); return }
+    if (isAdmin) return // l’admin ne répond pas à “voulez-vous remplacer ?”
 
     const { error } = await supabase
       .from("absence_responses")
@@ -153,6 +169,13 @@ export default function Absences({
       await supabase.from("absences").update({ status: "candidate" }).eq("id", absence.id)
     }
   }
+
+  // Filtrage client
+  const filtered = useMemo(() => {
+    if (filter === "all") return list
+    if (filter === "today") return list.filter(a => a.day === today)
+    return list.filter(a => a.day >= today) // upcoming
+  }, [list, filter, today])
 
   return (
     <div style={{ display: "grid", gap: 16 }}>
@@ -196,18 +219,25 @@ export default function Absences({
         </div>
       </div>
 
-      {/* Liste des absences */}
-      <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12 }}>
-        <h3 style={{ margin: 0, marginBottom: 8 }}>Absences & remplacements</h3>
-        {loading && <p>Chargement…</p>}
-        {!loading && list.length === 0 && <p>Aucune absence récente.</p>}
+      {/* Filtres */}
+      <div style={{ display: "flex", gap: 8 }}>
+        <button onClick={() => setFilter("today")}    disabled={filter==="today"}>Aujourd’hui</button>
+        <button onClick={() => setFilter("upcoming")} disabled={filter==="upcoming"}>À venir</button>
+        <button onClick={() => setFilter("all")}      disabled={filter==="all"}>Toutes</button>
+      </div>
 
-        {!loading && list.map((a) => {
+      {/* Liste */}
+      <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12 }}>
+        <h3 style={{ margin: 0, marginBottom: 8 }}>Absences</h3>
+        {loading && <p>Chargement…</p>}
+        {!loading && filtered.length === 0 && <p>Aucune absence.</p>}
+
+        {!loading && filtered.map((a) => {
           const ownerName = a.owner?.name ?? sellersById[a.seller_id]?.name ?? "?"
-          const replName  = a.replacement?.name ?? (a.replacement_seller_id ? (sellersById[a.replacement_seller_id]?.name ?? "?") : null)
+          const replName  = a.replacement?.name ?? (a.replacement_seller_id ? (sellersById[a.replacement_seller_id!]?.name ?? "?") : null)
           const mine = a.seller_id === me?.id
-          // ❌ L’admin ne doit PAS voir la question “remplacer ?”
-          const canAnswer = !mine && !isAdmin && a.status !== "approved"
+          const already = responses[a.id]
+          const canAnswer = !mine && !isAdmin && a.status !== "approved" && a.day >= today
 
           return (
             <div key={a.id} style={{ padding: 8, border: "1px solid #eee", borderRadius: 8, marginBottom: 8 }}>
@@ -236,13 +266,24 @@ export default function Absences({
                 <div style={{ marginTop: 8 }}>
                   <div style={{ marginBottom: 6 }}>Voulez-vous remplacer ?</div>
                   <div style={{ display: "flex", gap: 8 }}>
-                    <button onClick={() => respond(a, true)} style={{ borderColor: "#2e7d32", color: "#2e7d32" }}>
+                    <button
+                      disabled={already === "yes"}
+                      onClick={() => respond(a, true)}
+                      style={{ borderColor: "#2e7d32", color: "#2e7d32" }}
+                    >
                       Oui
                     </button>
-                    <button onClick={() => respond(a, false)} style={{ borderColor: "#c62828", color: "#c62828" }}>
+                    <button
+                      disabled={already === "no"}
+                      onClick={() => respond(a, false)}
+                      style={{ borderColor: "#c62828", color: "#c62828" }}
+                    >
                       Non
                     </button>
                   </div>
+                  {already && <div style={{ marginTop: 6, fontSize: 12, opacity: 0.8 }}>
+                    Votre réponse : <strong>{already === "yes" ? "Oui" : "Non"}</strong>
+                  </div>}
                 </div>
               )}
             </div>
