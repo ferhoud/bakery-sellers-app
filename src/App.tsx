@@ -55,7 +55,7 @@ function AuthView() {
 
   return (
     <div style={{ maxWidth: 380, margin: "64px auto", fontFamily: "system-ui" }}>
-      <h1 style={{ marginBottom: 8 }}>Connexion vendeuse</h1>
+      <h1 style={{ marginBottom: 8 }}>Connexion vendeuse — v13</h1>
       <p style={{ marginTop: 0, opacity: 0.8, fontSize: 14 }}>
         Entre ton <strong>identifiant</strong> (ex: <code>leila</code>) et ton <strong>code</strong>.
       </p>
