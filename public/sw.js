@@ -1,8 +1,8 @@
-/* Service Worker basique pour cache offline (après 1re visite) */
-const CACHE_NAME = "bakery-app-v1";
-const APP_SHELL = ["/", "/index.html", "/manifest.webmanifest"];
+/* Service Worker v3 – cache simple, index.html toujours frais en ligne */
+const CACHE_NAME = "bakery-app-v3";
+const APP_SHELL = ["/manifest.webmanifest"];
 
-// Activer immédiatement le SW
+// Install: précache minimum
 self.addEventListener("install", (event) => {
   self.skipWaiting();
   event.waitUntil(
@@ -10,6 +10,7 @@ self.addEventListener("install", (event) => {
   );
 });
 
+// Activate: nettoie anciens caches et prend le contrôle
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     (async () => {
@@ -20,9 +21,9 @@ self.addEventListener("activate", (event) => {
   );
 });
 
-// Stratégie :
-// - Navigations (HTML) : réseau d'abord, sinon index.html du cache (offline)
-// - Autres requêtes : cache d'abord, sinon réseau (et on met en cache au passage)
+// Fetch:
+// - Navigations (HTML): réseau d'abord, fallback index du cache si hors-ligne
+// - Autres: cache d'abord, sinon réseau (et on met en cache)
 self.addEventListener("fetch", (event) => {
   const req = event.request;
 
@@ -30,8 +31,7 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(
       (async () => {
         try {
-          const fresh = await fetch(req);
-          return fresh;
+          return await fetch(req); // toujours la version fraîche quand on est en ligne
         } catch {
           const cached = await caches.match("/index.html");
           return cached || new Response("Hors-ligne et pas encore en cache.", { status: 503 });
@@ -41,7 +41,6 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Static/assets
   event.respondWith(
     (async () => {
       const cached = await caches.match(req);
