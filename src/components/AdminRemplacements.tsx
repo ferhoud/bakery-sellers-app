@@ -7,10 +7,27 @@ const SLOT_LABEL: Record<string, string> = {
   close: "Après-midi (13:30–20:30)"
 }
 
-// Durées fixes (heures) par créneau
-const SLOT_HOURS: Record<string, number> = { open: 7, mid: 6, close: 7 }
-
 type Seller = { id: string; name: string; email: string; role?: string }
+type Absence = {
+  id: string
+  seller_id: string
+  day: string
+  slot: "open" | "mid" | "close"
+  status: "pending" | "candidate" | "approved" | "rejected" | "cancelled"
+  reason?: string | null
+  replacement_seller_id?: string | null
+  created_at: string
+  owner?: { id: string; name: string | null } | null
+  replacement?: { id: string; name: string | null } | null
+}
+type Resp = { absence_id: string; seller_id: string; will_replace: boolean; seller?: { id: string; name: string | null } | null }
+
+function ymdLocal(d: Date) {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, "0")
+  const day = String(d.getDate()).padStart(2, "0")
+  return `${y}-${m}-${day}`
+}
 
 export default function AdminRemplacements({
   currentSeller,
@@ -21,207 +38,168 @@ export default function AdminRemplacements({
   sellers: Seller[]
   isAdmin: boolean
 }) {
-  const me = currentSeller
-  const [pending, setPending] = useState<any[]>([])
-  const [candidatesByAbs, setCandidatesByAbs] = useState<Record<string, any[]>>({})
-  const [month, setMonth] = useState<string>(() => {
-    const d = new Date()
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`
-  })
-  const [totals, setTotals] = useState<Record<string, number>>({}) // seller_id -> heures
+  const today = ymdLocal(new Date())
+  const [loading, setLoading] = useState(false)
+  const [rows, setRows] = useState<Absence[]>([])
+  const [cands, setCands] = useState<Record<string, Resp[]>>({})
+  const [choice, setChoice] = useState<Record<string, string>>({}) // absence_id -> seller_id choisi
+  const [msg, setMsg] = useState<string | null>(null)
+  const [err, setErr] = useState<string | null>(null)
 
-  const sellersById = useMemo(() => {
-    const m: Record<string, Seller> = {}
-    sellers?.forEach((s) => (m[s.id] = s))
-    return m
-  }, [sellers])
+  const sellersById = useMemo(() => Object.fromEntries(sellers.map(s => [s.id, s])), [sellers])
 
-  async function loadCandidates() {
-    // Absences à valider : en attente OU candidate
-    const { data: abs } = await supabase
+  async function loadAll() {
+    setLoading(true)
+    setErr(null)
+    // Absences à traiter (aujourd’hui et à venir)
+    const { data: abs, error } = await supabase
       .from("absences")
-      .select("*")
-      .in("status", ["pending", "candidate"])
+      .select(`
+        id, seller_id, day, slot, status, reason, replacement_seller_id, created_at,
+        owner:seller_id ( id, name ),
+        replacement:replacement_seller_id ( id, name )
+      `)
+      .gte("day", today)
+      .in("status", ["pending","candidate"])
       .order("day", { ascending: true })
-    setPending(abs || [])
-
-    if (!abs?.length) { setCandidatesByAbs({}); return }
-
-    const ids = abs.map(a => a.id)
-    const { data: resp } = await supabase
-      .from("absence_responses")
-      .select("*")
-      .in("absence_id", ids)
-      .eq("will_replace", true)
       .order("created_at", { ascending: true })
 
-    const map: Record<string, any[]> = {}
-    resp?.forEach(r => {
-      map[r.absence_id] = map[r.absence_id] || []
-      map[r.absence_id].push(r)
-    })
-    setCandidatesByAbs(map)
-  }
+    if (error) { setErr(error.message); setLoading(false); return }
+    const list = (abs as any as Absence[]) || []
+    setRows(list)
 
-  async function validate(absence: any, candidateSellerId: string) {
-    if (!isAdmin || !me?.id) { alert("Réservé à l’admin."); return }
-
-    // 1) Met l’absence en validée
-    await supabase.from("absences").update({
-      status: "approved",
-      replacement_seller_id: candidateSellerId,
-      validated_by: me.id,
-      validated_at: new Date().toISOString()
-    }).eq("id", absence.id)
-
-    // 2) Applique au planning : affecte le créneau au remplaçant
-    // -> ATTENTION: adapte si ta table 'shifts' a un autre schéma
-    // Ici on suppose: day (date), slot (open/mid/close), seller_id
-    const { data: existing } = await supabase
-      .from("shifts")
-      .select("id")
-      .eq("day", absence.day)
-      .eq("slot", absence.slot)
-      .limit(1)
-      .maybeSingle()
-
-    if (existing?.id) {
-      await supabase.from("shifts").update({ seller_id: candidateSellerId }).eq("id", existing.id)
-    } else {
-      await supabase.from("shifts").insert({
-        day: absence.day,
-        slot: absence.slot,
-        seller_id: candidateSellerId
+    // Candidats (oui)
+    if (list.length) {
+      const ids = list.map(a => a.id)
+      const { data: rr } = await supabase
+        .from("absence_responses")
+        .select("absence_id, seller_id, will_replace, seller:seller_id ( id, name )")
+        .in("absence_id", ids)
+        .eq("will_replace", true)
+      const grouped: Record<string, Resp[]> = {}
+      ;(rr || []).forEach((r: any) => {
+        (grouped[r.absence_id] ||= []).push(r)
       })
+      setCands(grouped)
+    } else {
+      setCands({})
     }
 
-    // 3) Notifier tout le monde
-    try {
-      const all = sellers || []
-      await supabase.from("notifications").insert(
-        all.map((r) => ({
-          recipient_id: r.id,
-          kind: "replacement_validated",
-          title: "Remplacement validé",
-          body: `${sellersById[candidateSellerId]?.name || "Une vendeuse"} remplace ${sellersById[absence.seller_id]?.name || "?"} le ${absence.day} – ${SLOT_LABEL[absence.slot]}`,
-          data: { absence_id: absence.id, replacement_seller_id: candidateSellerId }
-        }))
-      )
-    } catch {}
-
-    await loadCandidates()
-    alert("Remplacement validé et planning mis à jour ✅")
-  }
-
-  async function loadTotals() {
-    // Calcule les heures du mois en cours (ou sélectionné) à partir de shifts
-    // Suppose: shifts(day date, slot text, seller_id uuid)
-    const [y, m] = month.split("-").map(Number)
-    const monthStart = new Date(y, m - 1, 1)
-    const monthEnd = new Date(y, m, 1) // exclu
-
-    const { data: sh } = await supabase
-      .from("shifts")
-      .select("seller_id, day, slot")
-      .gte("day", monthStart.toISOString().slice(0, 10))
-      .lt("day", monthEnd.toISOString().slice(0, 10))
-
-    const map: Record<string, number> = {}
-    ;(sh || []).forEach((row) => {
-      const h = SLOT_HOURS[row.slot] ?? 0
-      map[row.seller_id] = (map[row.seller_id] || 0) + h
-    })
-    setTotals(map)
+    setLoading(false)
   }
 
   useEffect(() => {
-    loadCandidates()
-    loadTotals()
+    loadAll()
     const ch = supabase
       .channel("admin-rt")
-      .on("postgres_changes", { event: "*", schema: "public", table: "absences" }, () => { loadCandidates(); loadTotals() })
-      .on("postgres_changes", { event: "*", schema: "public", table: "shifts" }, loadTotals)
+      .on("postgres_changes", { event: "*", schema: "public", table: "absences" }, loadAll)
+      .on("postgres_changes", { event: "*", schema: "public", table: "absence_responses" }, loadAll)
       .subscribe()
     return () => { supabase.removeChannel(ch) }
-  }, [month])
+  }, [])
 
-  const myHours = me?.id ? (totals[me.id] || 0) : 0
+  async function approve(a: Absence) {
+    setMsg(null); setErr(null)
+    const sel = choice[a.id] || cands[a.id]?.[0]?.seller_id // par défaut 1er candidat
+    if (!sel) { setErr("Choisis une remplaçante."); return }
+
+    // 1) pousser dans le planning (shifts)
+    // on remplace la ligne (day, slot) par la remplaçante
+    try {
+      // Supprimer l’existant pour (day, slot), puis insérer. (évite les problèmes de contrainte unique)
+      await supabase.from("shifts").delete().eq("day", a.day).eq("slot", a.slot)
+      const { error: eIns } = await supabase.from("shifts").insert({ day: a.day, slot: a.slot, seller_id: sel })
+      if (eIns) {
+        // Message plus clair si la vendeuse a déjà un autre créneau ce jour-là
+        if (String(eIns.message || "").includes("one_shift_per_day_per_seller") || String(eIns.message || "").includes("seller_id, day")) {
+          setErr("Cette vendeuse a déjà un autre créneau ce jour-là."); return
+        }
+        setErr(eIns.message); return
+      }
+    } catch (e: any) {
+      setErr(e?.message || "Erreur planning"); return
+    }
+
+    // 2) marquer l’absence validée
+    const { error: eUpd } = await supabase
+      .from("absences")
+      .update({ status: "approved", replacement_seller_id: sel, validated_by: currentSeller?.id || null, validated_at: new Date().toISOString() })
+      .eq("id", a.id)
+    if (eUpd) { setErr(eUpd.message); return }
+
+    // 3) notifier tout le monde
+    try {
+      const title = "Remplacement validé"
+      const body  = `${sellersById[sel]?.name || "Une vendeuse"} remplace ${sellersById[a.seller_id]?.name || "?"} le ${a.day} – ${SLOT_LABEL[a.slot]}`
+      const rows = sellers.map((r) => ({
+        recipient_id: r.id,
+        kind: "replacement_approved",
+        title, body,
+        data: { absence_id: a.id, day: a.day, slot: a.slot, replacement_id: sel }
+      }))
+      if (rows.length) await supabase.from("notifications").insert(rows)
+    } catch {}
+
+    setMsg("Remplacement validé ✅")
+    setTimeout(() => setMsg(null), 2500)
+  }
+
+  async function reject(a: Absence) {
+    setErr(null); setMsg(null)
+    const { error } = await supabase.from("absences").update({ status: "rejected", replacement_seller_id: null }).eq("id", a.id)
+    if (error) { setErr(error.message); return }
+    setMsg("Absence rejetée.")
+    setTimeout(() => setMsg(null), 2000)
+  }
 
   return (
-    <div style={{ display: "grid", gap: 16 }}>
-      {/* Bloc validation remplacements */}
-      <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12 }}>
-        <h3 style={{ margin: 0, marginBottom: 8 }}>Remplacements à valider</h3>
-        {!isAdmin && <p style={{ color: "#c62828" }}>Réservé à l’admin.</p>}
+    <div style={{ display: "grid", gap: 12 }}>
+      <h3 style={{ margin: 0 }}>Validation des remplacements</h3>
+      {msg && <div style={{ padding: 8, background: "#e8f5e9", border: "1px solid #c8e6c9", color: "#256029", borderRadius: 8 }}>{msg}</div>}
+      {err && <div style={{ padding: 8, background: "#ffebee", border: "1px solid #ffcdd2", color: "#b71c1c", borderRadius: 8 }}>{err}</div>}
+      {loading && <p>Chargement…</p>}
 
-        {pending.length === 0 && <p>Aucune demande en attente.</p>}
+      {!loading && rows.length === 0 && <p>Aucune absence à valider.</p>}
 
-        {pending.map((a) => {
-          const cands = candidatesByAbs[a.id] || []
-          return (
-            <div key={a.id} style={{ padding: 8, border: "1px solid #eee", borderRadius: 8, marginBottom: 8 }}>
-              <div><strong>{SLOT_LABEL[a.slot]}</strong> — {a.day}</div>
-              <div style={{ opacity: 0.8, marginBottom: 6 }}>
-                Absence de <strong>{sellersById[a.seller_id]?.name || "?"}</strong> — statut : <em>{a.status}</em>
+      {!loading && rows.map(a => {
+        const ownerName = a.owner?.name || sellersById[a.seller_id]?.name || "?"
+        const candidates = cands[a.id] || []
+        const chosen = choice[a.id] || candidates[0]?.seller_id || ""
+
+        return (
+          <div key={a.id} style={{ border: "1px solid #ddd", borderRadius: 10, padding: 10 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+              <div>
+                <strong>{ownerName}</strong> — {a.day} — <em>{SLOT_LABEL[a.slot]}</em>
+                {" · "}
+                <span style={{ padding: "2px 6px", borderRadius: 6, border: "1px solid #ddd" }}>
+                  {a.status === "pending" && "En attente"}
+                  {a.status === "candidate" && "Candidate trouvée"}
+                </span>
               </div>
-              {cands.length === 0 && <div>Aucune candidature pour le moment.</div>}
-              {cands.length > 0 && (
-                <div style={{ display: "grid", gap: 6 }}>
-                  {cands.map((c) => (
-                    <div key={c.id} style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                      <div>{sellersById[c.seller_id]?.name || "?"}</div>
-                      <button
-                        disabled={!isAdmin}
-                        onClick={() => validate(a, c.seller_id)}
-                        style={{ borderColor: "#2e7d32", color: "#2e7d32" }}
-                      >
-                        Valider ce remplacement
-                      </button>
-                    </div>
-                  ))}
-                </div>
+              {a.replacement_seller_id && (
+                <div>Proposée : <strong>{sellersById[a.replacement_seller_id]?.name || "?"}</strong></div>
               )}
             </div>
-          )
-        })}
-      </div>
 
-      {/* Totaux d'heures */}
-      <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12 }}>
-        <h3 style={{ margin: 0, marginBottom: 8 }}>Heures du mois</h3>
-
-        <div style={{ marginBottom: 8 }}>
-          <label>Mois :{" "}
-            <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} />
-          </label>
-          <button onClick={loadTotals} style={{ marginLeft: 8 }}>Recalculer</button>
-        </div>
-
-        {/* Vue vendeuse : son total */}
-        <div style={{ marginBottom: 8, padding: 8, background: "#f7f7f7", borderRadius: 8 }}>
-          Mes heures ({month}) : <strong>{myHours.toFixed(1)} h</strong>
-        </div>
-
-        {/* Vue admin : table complète */}
-        {isAdmin && (
-          <table>
-            <thead>
-              <tr>
-                <th style={{ textAlign: "left" }}>Vendeuse</th>
-                <th>Total (h)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {sellers.map((s) => (
-                <tr key={s.id}>
-                  <td>{s.name}</td>
-                  <td>{(totals[s.id] || 0).toFixed(1)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
+            <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <label>
+                Candidats :
+                <select value={chosen} onChange={(e) => setChoice(prev => ({ ...prev, [a.id]: e.target.value }))} style={{ marginLeft: 6 }}>
+                  {candidates.length === 0 && <option value="">— aucun —</option>}
+                  {candidates.map(c => (
+                    <option key={c.seller_id} value={c.seller_id}>
+                      {c.seller?.name || "?"}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button onClick={() => approve(a)} disabled={!isAdmin || (!chosen && candidates.length===0)}>Valider</button>
+              <button onClick={() => reject(a)}  disabled={!isAdmin}>Rejeter</button>
+            </div>
+          </div>
+        )
+      })}
     </div>
   )
 }
