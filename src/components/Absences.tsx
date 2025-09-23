@@ -22,6 +22,7 @@ export default function Absences({
   const [loading, setLoading] = useState(false)
   const [list, setList] = useState<any[]>([])
   const [responses, setResponses] = useState<Record<string, "yes" | "no">>({})
+  const [sent, setSent] = useState(false) // ⬅️ bandeau “Demande envoyée ✅”
 
   // Formulaire
   const [day, setDay] = useState<string>("")
@@ -36,7 +37,6 @@ export default function Absences({
 
   async function loadAll() {
     setLoading(true)
-    // Absences à partir d’aujourd’hui - 14j (pour voir récent)
     const { data: abs } = await supabase
       .from("absences")
       .select("*")
@@ -66,7 +66,7 @@ export default function Absences({
 
   useEffect(() => {
     loadAll()
-    // Realtime : écoute absences et réponses
+    // Realtime
     const ch1 = supabase
       .channel("absences-rt")
       .on("postgres_changes", { event: "*", schema: "public", table: "absences" }, loadAll)
@@ -92,9 +92,9 @@ export default function Absences({
       .single()
     if (error) { alert(error.message); setLoading(false); return }
 
-    // Crée des notifications pour tout le monde (sauf le demandeur)
+    // ✅ Notifier TOUT LE MONDE (y compris l’admin et éventuellement le demandeur)
     try {
-      const recipients = sellers.filter((s) => s.id !== me.id)
+      const recipients = sellers // pas de filtre — tout le monde
       if (recipients.length) {
         await supabase.from("notifications").insert(
           recipients.map((r) => ({
@@ -108,10 +108,14 @@ export default function Absences({
       }
     } catch {}
 
+    // UI : “Demande envoyée ✅”
+    setSent(true)
     setDay("")
     setSlot("open")
     setReason("")
     setLoading(false)
+    // Masquer le bandeau après 4s
+    setTimeout(() => setSent(false), 4000)
   }
 
   async function respond(absence: any, willReplace: boolean) {
@@ -119,6 +123,7 @@ export default function Absences({
     await supabase
       .from("absence_responses")
       .upsert({ absence_id: absence.id, seller_id: me.id, will_replace: willReplace })
+
     // Notifier l’admin si quelqu’un dit OUI
     if (willReplace) {
       const admin = sellers.find((s) => s.role === "admin")
@@ -140,6 +145,16 @@ export default function Absences({
 
   return (
     <div style={{ display: "grid", gap: 16 }}>
+      {/* Bandeau confirmation */}
+      {sent && (
+        <div style={{
+          padding: 10, border: "1px solid #c8e6c9", background: "#e8f5e9",
+          color: "#256029", borderRadius: 8
+        }}>
+          Demande envoyée ✅ — tout le monde a été notifié.
+        </div>
+      )}
+
       {/* Créer une absence */}
       <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12 }}>
         <h3 style={{ margin: 0, marginBottom: 8 }}>Demander une absence</h3>
