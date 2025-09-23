@@ -24,8 +24,12 @@ type AbsenceRow = {
   replacement?: { id: string; name: string | null } | null
 }
 
-function toISODate(d: Date) {
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).toISOString().slice(0, 10)
+// ✅ format YYYY-MM-DD en LOCAL (pas d'UTC)
+function ymdLocal(d: Date) {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, "0")
+  const day = String(d.getDate()).padStart(2, "0")
+  return `${y}-${m}-${day}`
 }
 
 // Couleur stable par vendeuse
@@ -48,14 +52,14 @@ export default function Schedule({ isAdmin }: { isAdmin: boolean }) {
   const [busy, setBusy] = useState(false)
   const sellersById = useMemo(() => Object.fromEntries(sellers.map(s => [s.id, s])), [sellers])
 
-  // Semaine (lundi → dimanche)
+  // Semaine (lundi → dimanche) en LOCAL
   const base = new Date()
   const weekStart = new Date(base)
   weekStart.setDate(base.getDate() - ((base.getDay() + 6) % 7)) // lundi
-  const weekDays: string[] = Array.from({ length: 7 }, (_, i) => toISODate(new Date(weekStart.getTime() + i * 86400000)))
-  const todayStr = toISODate(new Date())
+  const weekDays: string[] = Array.from({ length: 7 }, (_, i) => ymdLocal(new Date(weekStart.getTime() + i * 86400000)))
+  const todayStr = ymdLocal(new Date())
 
-  // Accès rapide aux shifts par (day|slot)
+  // Accès rapide
   const keyOf = (day: string, slot: SlotKey) => `${day}|${slot}`
   const mapShifts = useMemo(() => {
     const m = new Map<string, ShiftRow>()
@@ -67,12 +71,7 @@ export default function Schedule({ isAdmin }: { isAdmin: boolean }) {
     const row = mapShifts.get(keyOf(day, slot))
     return row?.seller_id || ""
   }
-  function getSellerName(day: string, slot: SlotKey) {
-    const id = getSellerId(day, slot)
-    return id ? (sellersById[id]?.name || "?") : ""
-  }
 
-  // Empêcher une double affectation d’une vendeuse le même jour (1 seul créneau par jour)
   function alreadyAssignedThisDay(sellerId: string, day: string, exceptSlot?: SlotKey) {
     if (!sellerId) return false
     return SLOTS.some(sl => {
@@ -82,15 +81,16 @@ export default function Schedule({ isAdmin }: { isAdmin: boolean }) {
     })
   }
 
-  // Charger données
   async function loadAll() {
     // vendeuses
     const { data: s } = await supabase.from("sellers").select("id,name,email,role").order("name", { ascending: true })
     setSellers(s || [])
 
-    // shifts (semaine)
+    // shifts (semaine) — bornes locales
     const startStr = weekDays[0]
-    const endStr = toISODate(new Date(new Date(weekDays[6]).getTime() + 86400000)) // lundi suivant (exclu)
+    const endStrDate = new Date(weekStart.getTime() + 7 * 86400000) // lundi suivant
+    const endStr = ymdLocal(endStrDate)
+
     const { data: sh } = await supabase
       .from("shifts")
       .select("id, day, slot, seller_id")
@@ -99,7 +99,7 @@ export default function Schedule({ isAdmin }: { isAdmin: boolean }) {
       .order("day", { ascending: true })
     setShifts((sh as any) || [])
 
-    // absences du jour (avec noms joints pour éviter “?”)
+    // absences du jour (jointure noms)
     const { data: abs } = await supabase
       .from("absences")
       .select(`
@@ -122,50 +122,43 @@ export default function Schedule({ isAdmin }: { isAdmin: boolean }) {
     return () => { supabase.removeChannel(ch) }
   }, [])
 
-  // Affectation / désaffectation
   async function setAssignment(day: string, slot: SlotKey, sellerId: string) {
     if (!isAdmin) return
     setBusy(true)
     try {
-      // Empêche 2 créneaux le même jour pour la même vendeuse
       if (sellerId && alreadyAssignedThisDay(sellerId, day, slot)) {
         alert("Cette vendeuse est déjà affectée à un autre créneau le même jour.")
         setBusy(false)
         return
       }
-
       const existing = mapShifts.get(keyOf(day, slot))
       if (!sellerId) {
-        // suppression
-        if (existing?.id) {
-          await supabase.from("shifts").delete().eq("id", existing.id)
-        }
+        if (existing?.id) await supabase.from("shifts").delete().eq("id", existing.id)
       } else if (existing?.id) {
         await supabase.from("shifts").update({ seller_id: sellerId }).eq("id", existing.id)
       } else {
         await supabase.from("shifts").insert({ day, slot, seller_id: sellerId })
       }
-      // recharger
       await loadAll()
     } finally {
       setBusy(false)
     }
   }
 
-  // Bandeau “planning du jour” (ruban long)
-  const todayOpen = getSellerId(todayStr, "open")
-  const todayMid = getSellerId(todayStr, "mid")
+  // Ruban du jour
+  const todayOpen  = getSellerId(todayStr, "open")
+  const todayMid   = getSellerId(todayStr, "mid")
   const todayClose = getSellerId(todayStr, "close")
 
   return (
     <div style={{ display: "grid", gap: 16 }}>
-      {/* 1) Absences du jour (toujours en PREMIER) */}
+      {/* Absences du jour (en premier) */}
       <div style={{ border: "2px solid #ffc107", background: "#fff8e1", borderRadius: 10, padding: 12 }}>
         <h3 style={{ margin: 0, marginBottom: 8 }}>Absences du jour</h3>
         {todayAbsences.length === 0 && <div>Aucune absence aujourd’hui.</div>}
         {todayAbsences.map(a => {
           const ownerName = a.owner?.name ?? sellersById[a.seller_id]?.name ?? "?"
-          const replName  = a.replacement?.name ?? (a.replacement_seller_id ? (sellersById[a.replacement_seller_id]?.name ?? "?") : null)
+          const replName  = a.replacement?.name ?? (a.replacement_seller_id ? (sellersById[a.replacement_seller_id!]?.name ?? "?") : null)
           return (
             <div key={a.id} style={{ padding: 8, border: "1px solid #ffe082", background: "#fffde7", borderRadius: 8, marginBottom: 8 }}>
               <strong>{ownerName}</strong> — <em>{SLOT_LABEL[a.slot]}</em>
@@ -183,68 +176,36 @@ export default function Schedule({ isAdmin }: { isAdmin: boolean }) {
         })}
       </div>
 
-      {/* 2) Ruban “planning du jour” (06:30→20:30) */}
+      {/* Ruban “planning du jour” */}
       <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12 }}>
         <h3 style={{ marginTop: 0, marginBottom: 8 }}>Planning du jour — {todayStr}</h3>
         <div style={{ display: "flex", gap: 6, alignItems: "stretch" }}>
-          {/* open 7h */}
-          <div
-            style={{
-              flex: 7,
-              minHeight: 44,
-              borderRadius: 8,
-              border: "1px solid #ccc",
-              background: todayOpen ? colorFor(todayOpen) : "#f6f6f6",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              color: todayOpen ? "#000" : "#888",
-              fontWeight: 600
-            }}
-            title={SLOT_LABEL.open}
-          >
-            {todayOpen ? (sellersById[todayOpen]?.name || "?") : "—"}
-          </div>
-          {/* mid 6h */}
-          <div
-            style={{
-              flex: 6,
-              minHeight: 44,
-              borderRadius: 8,
-              border: "1px solid #ccc",
-              background: todayMid ? colorFor(todayMid) : "#f6f6f6",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              color: todayMid ? "#000" : "#888",
-              fontWeight: 600
-            }}
-            title={SLOT_LABEL.mid}
-          >
-            {todayMid ? (sellersById[todayMid]?.name || "?") : "—"}
-          </div>
-          {/* close 7h */}
-          <div
-            style={{
-              flex: 7,
-              minHeight: 44,
-              borderRadius: 8,
-              border: "1px solid #ccc",
-              background: todayClose ? colorFor(todayClose) : "#f6f6f6",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              color: todayClose ? "#000" : "#888",
-              fontWeight: 600
-            }}
-            title={SLOT_LABEL.close}
-          >
-            {todayClose ? (sellersById[todayClose]?.name || "?") : "—"}
-          </div>
+          {(["open","mid","close"] as SlotKey[]).map(slot => {
+            const sid = slot === "open" ? todayOpen : slot === "mid" ? todayMid : todayClose
+            return (
+              <div key={slot}
+                style={{
+                  flex: slot === "mid" ? 6 : 7,
+                  minHeight: 44,
+                  borderRadius: 8,
+                  border: "1px solid #ccc",
+                  background: sid ? colorFor(sid) : "#f6f6f6",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  color: sid ? "#000" : "#888",
+                  fontWeight: 600
+                }}
+                title={SLOT_LABEL[slot]}
+              >
+                {sid ? (sellersById[sid]?.name || "?") : "—"}
+              </div>
+            )
+          })}
         </div>
       </div>
 
-      {/* 3) Planning de la semaine (menu interactif rétabli) */}
+      {/* Planning de la semaine (menus interactifs pour ADMIN) */}
       <div style={{ overflowX: "auto" }}>
         <table>
           <thead>
