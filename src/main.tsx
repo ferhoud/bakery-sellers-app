@@ -9,7 +9,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
   </React.StrictMode>
 )
 
-// PWA désactivée TEMPORAIREMENT pour éviter tout cache
+// 🔕 PWA coupée juste pour tester l'UI fraîche (pas d'enregistrement du SW)
 if (false && import.meta.env.PROD && "serviceWorker" in navigator) {
   window.addEventListener("load", () => {
     navigator.serviceWorker.register("/sw-v5.js")
