@@ -82,32 +82,36 @@ export default function App() {
   const [sellers, setSellers] = useState<Seller[]>([])
   const [tab, setTab] = useState<TabKey>("planning")
 
-  // Déconnexion FORTE (efface session Supabase + caches + SW)
+  // Toasts notifications (in-app)
+  const [toasts, setToasts] = useState<{ id: string; title?: string; body?: string }[]>([])
+
+  const pushToast = (t: { id: string; title?: string; body?: string }) => {
+    setToasts((prev) => [...prev, t])
+    setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== t.id)), 6000)
+  }
+
+  // Déconnexion FORTE
   const hardLogout = async () => {
     try {
       await supabase.auth.signOut({ scope: "global" } as any).catch(() => supabase.auth.signOut())
     } catch {}
     try {
-      // Nettoyage stockage
       try { localStorage.clear() } catch {}
       try { sessionStorage.clear() } catch {}
-      // Nettoyage caches PWA
       if ("caches" in window) {
         const keys = await caches.keys()
         await Promise.all(keys.map((k) => caches.delete(k)))
       }
-      // Désinscrire les Service Workers
       if ("serviceWorker" in navigator) {
         const regs = await navigator.serviceWorker.getRegistrations()
         await Promise.all(regs.map((r) => r.unregister()))
       }
     } finally {
-      // Retour à l'écran de connexion
       location.href = location.origin
     }
   }
 
-  // Si on ouvre avec ?logout=1 -> forcer la déconnexion
+  // ?logout=1 -> déconnexion forte
   useEffect(() => {
     const p = new URLSearchParams(location.search)
     if (p.get("logout") === "1") {
@@ -116,6 +120,7 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Session
   useEffect(() => {
     let mounted = true
     ;(async () => {
@@ -130,6 +135,7 @@ export default function App() {
     return () => { sub.subscription.unsubscribe() }
   }, [])
 
+  // Chargement profil + liste vendeuses
   useEffect(() => {
     if (!session) { setCurrentSeller(null); return }
     ;(async () => {
@@ -149,6 +155,21 @@ export default function App() {
       setSellers(s || [])
     })()
   }, [session])
+
+  // 🔔 Realtime notifications -> toasts
+  useEffect(() => {
+    if (!currentSeller?.id) return
+    const ch = supabase
+      .channel("notif-" + currentSeller.id)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "notifications" }, (payload) => {
+        const n: any = payload.new
+        if (n?.recipient_id === currentSeller.id) {
+          pushToast({ id: n.id, title: n.title || "Notification", body: n.body })
+        }
+      })
+      .subscribe()
+    return () => { supabase.removeChannel(ch) }
+  }, [currentSeller?.id])
 
   const isAdmin = currentSeller?.role === "admin"
 
@@ -179,6 +200,16 @@ export default function App() {
       {tab === "planning" && <Schedule isAdmin={!!isAdmin} />}
       {tab === "absences" && <Absences currentSeller={currentSeller} isAdmin={!!isAdmin} sellers={sellers} />}
       {tab === "admin" && <AdminRemplacements currentSeller={currentSeller} sellers={sellers} isAdmin={!!isAdmin} />}
+
+      {/* 🔔 Toasts */}
+      <div style={{ position: "fixed", right: 12, bottom: 12, display: "grid", gap: 8, zIndex: 9999, maxWidth: 340 }}>
+        {toasts.map((t) => (
+          <div key={t.id} style={{ background: "#333", color: "#fff", padding: "10px 12px", borderRadius: 10, boxShadow: "0 8px 24px rgba(0,0,0,.25)" }}>
+            <div style={{ fontWeight: 700, marginBottom: 2 }}>{t.title || "Notification"}</div>
+            {t.body && <div style={{ opacity: 0.9, fontSize: 14 }}>{t.body}</div>}
+          </div>
+        ))}
+      </div>
     </div>
   )
 }
